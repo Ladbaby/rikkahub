@@ -23,6 +23,14 @@ Built with Jetpack Compose, Kotlin, and follows Material Design 3 principles.
   built from web-ui/ React project)
 - **workspace**: Sandboxed per-workspace file system and shell execution environment exposed to the AI as tools.
 
+### Build From Scratch (Debug Build)
+
+```shell
+git submodule update --init --recursive   # one-time
+cd web-ui && pnpm install && cd ..        # one-time
+.\gradlew.bat :app:assembleDebug
+```
+
 ### Key Technologies
 
 - **Jetpack Compose**: Modern UI toolkit
