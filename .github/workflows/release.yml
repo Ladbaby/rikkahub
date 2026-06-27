@@ -79,7 +79,7 @@ jobs:
         run: |
           PREV=$(git tag --sort=-creatordate | grep -v "^${{ steps.version.outputs.version }}$" | head -1)
           if [ -z "$PREV" ]; then
-            echo "No previous tag found — listing all commits from repo start."
+            echo "No previous tag found — listing all commits up to HEAD."
             echo "prev=ALL" >> $GITHUB_OUTPUT
           else
             echo "Previous tag: $PREV"
@@ -89,7 +89,8 @@ jobs:
       - name: Generate release notes
         run: |
           if [ "${{ steps.prev.outputs.prev }}" = "ALL" ]; then
-            bash .github/gen_release_note.sh -v "...${{ steps.version.outputs.version }}"
+            # The release tag isn't pushed yet, so use HEAD as the upper bound.
+            bash .github/gen_release_note.sh -v "...HEAD"
           else
             bash .github/gen_release_note.sh \
               -v "${{ steps.prev.outputs.prev }}...${{ steps.version.outputs.version }}"
