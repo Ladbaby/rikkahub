@@ -8,6 +8,7 @@ import kotlinx.serialization.json.Json
 import me.rerere.tts.model.AudioChunk
 import me.rerere.tts.model.AudioFormat
 import me.rerere.tts.model.TTSRequest
+import me.rerere.tts.model.TtsHttpException
 import me.rerere.tts.provider.TTSProvider
 import me.rerere.tts.provider.TTSProviderSetting
 import okhttp3.MediaType.Companion.toMediaType
@@ -48,7 +49,19 @@ class OpenAITTSProvider : TTSProvider<TTSProviderSetting.OpenAI> {
         val response = httpClient.newCall(httpRequest).execute()
 
         if (!response.isSuccessful) {
-            throw Exception("TTS request failed: ${response.code} ${response.message}")
+            // OkHttp 的 ResponseBody 是一次性的：先读取再抛出，错误体丢失后无法再读。
+            val rawBody = runCatching { response.body.string() }.getOrNull()
+            val parsedMessage = runCatching {
+                rawBody?.let { JSONObject(it).optJSONObject("error")?.optString("message") }
+            }.getOrNull()?.takeIf { it.isNotBlank() }
+            val friendly = parsedMessage
+                ?: "TTS request failed: ${response.code} ${response.message}"
+            throw TtsHttpException(
+                httpCode = response.code,
+                httpMessage = response.message,
+                errorBody = rawBody,
+                extractedMessage = friendly,
+            )
         }
 
         val audioData = response.body.bytes()

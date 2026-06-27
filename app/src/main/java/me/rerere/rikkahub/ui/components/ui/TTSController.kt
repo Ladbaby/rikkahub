@@ -33,15 +33,18 @@ import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.Forward02
 import me.rerere.hugeicons.stroke.Pause
 import me.rerere.hugeicons.stroke.Play
+import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.context.LocalTTSState
 import me.rerere.rikkahub.ui.hooks.CustomTtsState
 import me.rerere.tts.model.PlaybackState
 import me.rerere.tts.model.PlaybackStatus
+import com.dokar.sonner.ToastType
 
 @Composable
 fun TTSController() {
     val context = LocalContext.current
     val ttsState = LocalTTSState.current
+    val toaster = LocalToaster.current
 
     val isSpeaking by ttsState.isSpeaking.collectAsState()
     var isVisible by remember { mutableStateOf(false) }
@@ -51,6 +54,16 @@ fun TTSController() {
             // 如果开启，显示悬浮窗
             isVisible = true
         }
+    }
+
+    val lastHttpError by ttsState.lastHttpError.collectAsState()
+    LaunchedEffect(lastHttpError) {
+        val err = lastHttpError ?: return@LaunchedEffect
+        toaster.show(
+            message = "TTS ${err.httpCode} · ${err.extractedMessage}",
+            type = ToastType.Error,
+        )
+        ttsState.clearLastHttpError()
     }
 
     FloatingWindow(

@@ -19,6 +19,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.rerere.tts.model.PlaybackState
 import me.rerere.tts.model.PlaybackStatus
+import me.rerere.tts.model.TtsHttpException
 import me.rerere.tts.model.TTSResponse
 import me.rerere.tts.provider.TTSManager
 import me.rerere.tts.provider.TTSProviderSetting
@@ -67,6 +68,9 @@ class TtsController(
 
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
+
+    private val _lastHttpError = MutableStateFlow<TtsHttpException?>(null)
+    val lastHttpError: StateFlow<TtsHttpException?> = _lastHttpError.asStateFlow()
 
     private val _currentChunk = MutableStateFlow(0)
     val currentChunk: StateFlow<Int> = _currentChunk.asStateFlow()
@@ -217,6 +221,10 @@ class TtsController(
         audio.release()
     }
 
+    fun clearLastHttpError() {
+        _lastHttpError.update { null }
+    }
+
     // region 内部：播放调度
     private fun startWorker() {
         val provider = currentProvider
@@ -256,6 +264,9 @@ class TtsController(
                         if (e is CancellationException) throw e
                         Log.e(TAG, "Synthesis error", e)
                         _error.update { e.message ?: "TTS synthesis error" }
+                        if (e is TtsHttpException) {
+                            _lastHttpError.update { e }
+                        }
                         processedCount++
                         continue
                     }

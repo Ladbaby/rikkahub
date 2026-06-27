@@ -15,6 +15,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import me.rerere.tts.model.PlaybackState
+import me.rerere.tts.model.TtsHttpException
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.getSelectedTTSProvider
 import me.rerere.rikkahub.utils.stripMarkdown
@@ -75,6 +76,9 @@ interface CustomTtsState {
     /** Flow holding any error message. */
     val error: StateFlow<String?>
 
+    /** Flow holding the most recent HTTP error (only populated by providers that throw TtsHttpException). */
+    val lastHttpError: StateFlow<TtsHttpException?>
+
     /** Flow indicating current chunk being processed (index) */
     val currentChunk: StateFlow<Int>
 
@@ -105,6 +109,9 @@ interface CustomTtsState {
     /** Fast forward current playback by [ms]. */
     fun fastForward(ms: Long = 5_000)
 
+    /** Clear the last HTTP error so it isn't re-toasted. */
+    fun clearLastHttpError()
+
     /** Set playback [speed]. */
     fun setSpeed(speed: Float)
 
@@ -129,6 +136,7 @@ private class CustomTtsStateImpl(
     override val isAvailable: StateFlow<Boolean> get() = controller.isAvailable
     override val isSpeaking: StateFlow<Boolean> get() = controller.isSpeaking
     override val error: StateFlow<String?> get() = controller.error
+    override val lastHttpError: StateFlow<TtsHttpException?> get() = controller.lastHttpError
     override val currentChunk: StateFlow<Int> get() = controller.currentChunk
     override val totalChunks: StateFlow<Int> get() = controller.totalChunks
     override val playbackState: StateFlow<PlaybackState> get() = controller.playbackState
@@ -162,6 +170,10 @@ private class CustomTtsStateImpl(
 
     override fun fastForward(ms: Long) {
         controller.fastForward(ms)
+    }
+
+    override fun clearLastHttpError() {
+        controller.clearLastHttpError()
     }
 
     override fun setSpeed(speed: Float) {
