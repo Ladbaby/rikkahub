@@ -19,6 +19,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.rerere.tts.model.PlaybackState
 import me.rerere.tts.model.PlaybackStatus
+import me.rerere.tts.model.AudioFormat
 import me.rerere.tts.model.TtsHttpException
 import me.rerere.tts.model.TTSResponse
 import me.rerere.tts.provider.TTSManager
@@ -43,11 +44,16 @@ class TtsController(
     private val chunker = TextChunker(maxChunkLength = 160)
     private val synthesizer = TtsSynthesizer(ttsManager)
     private val audio = AudioPlayer(context)
+    private val diskCache = TtsDiskCache(context)
 
     // Provider & 作业
     private var currentProvider: TTSProviderSetting? = null
     private var workerJob: Job? = null
     private var isPaused = false
+
+    // 重放缓存：上一次朗读的会话元数据
+    private var currentSessionId: UUID? = null
+    private var lastSessionManifest: TtsSessionManifest? = null
 
     // 队列与缓存（基于稳定 ID）
     private val queue: java.util.concurrent.ConcurrentLinkedQueue<TtsChunk> = java.util.concurrent.ConcurrentLinkedQueue()
@@ -95,12 +101,27 @@ class TtsController(
                 }
             }
         }
+        // 冷启动时尝试从磁盘恢复上一次会话，使进程被杀后 replayLast 仍可用
+        scope.launch {
+            val manifest = diskCache.latestSession() ?: return@launch
+            // 此时还没有 provider；先保留，恢复后再由 setProvider 校验指纹
+            lastSessionManifest = manifest
+        }
     }
 
     /** 选择/取消选择 Provider */
     fun setProvider(provider: TTSProviderSetting?) {
         currentProvider = provider
         _isAvailable.update { provider != null }
+        if (provider != null) {
+            // 若磁盘上保留的会话与新 provider 不一致，丢弃旧缓存以免重放错音频
+            val cached = lastSessionManifest
+            if (cached != null && cached.providerFingerprint != diskCache.fingerprint(provider)) {
+                scope.launch { diskCache.deleteSession(UUID.fromString(cached.sessionId)) }
+                lastSessionManifest = null
+                currentSessionId = null
+            }
+        }
         if (provider == null) stop()
     }
 
@@ -122,6 +143,21 @@ class TtsController(
 
         if (flush) {
             internalReset()
+            // 创建新的会话 ID 并立即落盘 manifest，便于 replayLast
+            val newSessionId = UUID.randomUUID()
+            currentSessionId = newSessionId
+            scope.launch {
+                diskCache.evictOlderThan(MAX_TTS_SESSIONS)
+                val manifest = TtsSessionManifest(
+                    sessionId = newSessionId.toString(),
+                    createdAt = System.currentTimeMillis(),
+                    providerFingerprint = diskCache.fingerprint(provider),
+                    originalText = text,
+                    chunkCount = newChunks.size,
+                    chunkTexts = newChunks.map { it.text },
+                )
+                diskCache.writeManifest(manifest)
+            }
             allChunks.addAll(newChunks)
             queue.addAll(newChunks)
             _currentChunk.update { 0 }
@@ -132,6 +168,16 @@ class TtsController(
             allChunks.addAll(remapped)
             queue.addAll(remapped)
         }
+        // 记录最近一次会话，供 replayLast 使用
+        lastSessionManifest = TtsSessionManifest(
+            sessionId = (currentSessionId ?: UUID.randomUUID()).toString(),
+            createdAt = System.currentTimeMillis(),
+            providerFingerprint = diskCache.fingerprint(provider),
+            originalText = text,
+            chunkCount = if (flush) newChunks.size else (lastSessionManifest?.chunkCount ?: 0) + newChunks.size,
+            chunkTexts = if (flush) newChunks.map { it.text }
+                else (lastSessionManifest?.chunkTexts ?: emptyList()) + newChunks.map { it.text },
+        )
         _totalChunks.update { queue.size }
         _error.update { null }
 
@@ -221,6 +267,27 @@ class TtsController(
         audio.release()
     }
 
+    /**
+     * 重放最近一次朗读。空操作情形：
+     * - 未配置 provider
+     * - 没有可用的上一次会话（首次启动 / 缓存被清空 / provider 切换后旧缓存已失效）
+     */
+    fun replayLast() {
+        val manifest = lastSessionManifest ?: return
+        val provider = currentProvider ?: run {
+            _error.update { "No TTS provider selected" }
+            return
+        }
+        if (manifest.providerFingerprint != diskCache.fingerprint(provider)) {
+            // 缓存已失效，丢弃并要求用户重新朗读
+            scope.launch { diskCache.deleteSession(UUID.fromString(manifest.sessionId)) }
+            lastSessionManifest = null
+            return
+        }
+        // 复用 speak 入口：写入新的会话 ID，确保后续缓存落到正确的目录
+        speak(manifest.originalText, flush = true)
+    }
+
     fun clearLastHttpError() {
         _lastHttpError.update { null }
     }
@@ -295,6 +362,7 @@ class TtsController(
 
     private fun prefetchFrom(startIndex: Int) {
         val provider = currentProvider ?: return
+        val sessionId = currentSessionId ?: return
         val begin = startIndex.coerceAtLeast(lastPrefetchedIndex + 1)
         val endExclusive = (begin + prefetchCount).coerceAtMost(allChunks.size)
         if (begin >= endExclusive) return
@@ -302,21 +370,48 @@ class TtsController(
         for (i in begin until endExclusive) {
             val chunk = allChunks.getOrNull(i) ?: continue
             cache.computeIfAbsent(chunk.id) {
-                scope.async(Dispatchers.IO) { synthesizer.synthesize(provider, chunk) }
+                scope.async(Dispatchers.IO) { synthesizeOrLoad(provider, chunk, sessionId) }
             }
         }
         lastPrefetchedIndex = endExclusive - 1
     }
 
     private suspend fun awaitOrCreate(chunk: TtsChunk, provider: TTSProviderSetting): TTSResponse {
+        val sessionId = currentSessionId
         val deferred = cache.computeIfAbsent(chunk.id) {
-            scope.async(Dispatchers.IO) { synthesizer.synthesize(provider, chunk) }
+            scope.async(Dispatchers.IO) {
+                if (sessionId != null) {
+                    diskCache.readChunk(sessionId, chunk.index)?.let { bytes ->
+                        return@async TTSResponse(
+                            audioData = bytes,
+                            format = AudioFormat.MP3,
+                            metadata = mapOf("source" to "disk"),
+                        )
+                    }
+                }
+                synthesizeOrLoad(provider, chunk, sessionId)
+            }
         }
         return try {
             deferred.await()
         } finally {
-            // 可按需保留缓存（此处保留，便于重播/重试）
+            // 缓存项在 reset/stop 时统一清空
         }
+    }
+
+    /**
+     * 合成音频并落盘。磁盘写入失败不会阻塞播放。
+     */
+    private suspend fun synthesizeOrLoad(
+        provider: TTSProviderSetting,
+        chunk: TtsChunk,
+        sessionId: UUID?,
+    ): TTSResponse {
+        val response = synthesizer.synthesize(provider, chunk)
+        if (sessionId != null) {
+            diskCache.writeChunk(sessionId, chunk.index, response.audioData)
+        }
+        return response
     }
     // endregion
 }

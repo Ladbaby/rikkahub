@@ -33,6 +33,7 @@ import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.Forward02
 import me.rerere.hugeicons.stroke.Pause
 import me.rerere.hugeicons.stroke.Play
+import me.rerere.hugeicons.stroke.Replay
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.context.LocalTTSState
 import me.rerere.rikkahub.ui.hooks.CustomTtsState
@@ -150,6 +151,10 @@ private fun PlayPauseButton(
                     ttsState.pause()
                 }
 
+                PlaybackStatus.Ended, PlaybackStatus.Idle -> {
+                    ttsState.replayLast()
+                }
+
                 else -> {
                     ttsState.resume()
                 }
@@ -160,8 +165,13 @@ private fun PlayPauseButton(
             contentColor = MaterialTheme.colorScheme.onTertiaryContainer
         )
     ) {
+        val icon = when (playbackState.status) {
+            PlaybackStatus.Playing -> HugeIcons.Pause
+            PlaybackStatus.Ended -> HugeIcons.Replay
+            else -> HugeIcons.Play
+        }
         Icon(
-            imageVector = if (playbackState.status == PlaybackStatus.Playing) HugeIcons.Pause else HugeIcons.Play,
+            imageVector = icon,
             contentDescription = null,
         )
         if (playbackState.status == PlaybackStatus.Playing || playbackState.status == PlaybackStatus.Buffering || playbackState.status == PlaybackStatus.Paused) {

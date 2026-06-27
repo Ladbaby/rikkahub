@@ -109,6 +109,9 @@ interface CustomTtsState {
     /** Fast forward current playback by [ms]. */
     fun fastForward(ms: Long = 5_000)
 
+    /** Replay the last spoken session if available. */
+    fun replayLast()
+
     /** Clear the last HTTP error so it isn't re-toasted. */
     fun clearLastHttpError()
 
@@ -170,6 +173,10 @@ private class CustomTtsStateImpl(
 
     override fun fastForward(ms: Long) {
         controller.fastForward(ms)
+    }
+
+    override fun replayLast() {
+        controller.replayLast()
     }
 
     override fun clearLastHttpError() {
