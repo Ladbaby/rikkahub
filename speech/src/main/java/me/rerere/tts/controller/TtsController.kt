@@ -143,20 +143,40 @@ class TtsController(
 
         if (flush) {
             internalReset()
-            // 创建新的会话 ID 并立即落盘 manifest，便于 replayLast
-            val newSessionId = UUID.randomUUID()
+            // 优先复用磁盘上同一文本的已有会话，避免在冷启动后用户重新朗读同一消息时
+            // 旋转 sessionId 导致原缓存失效、replay 时全量重新合成。
+            val fingerprint = diskCache.fingerprint(provider)
+            val adopted = diskCache.findSessionByTextBlocking(text, fingerprint)
+            val newSessionId = if (adopted != null) {
+                UUID.fromString(adopted.sessionId)
+            } else {
+                UUID.randomUUID()
+            }
             currentSessionId = newSessionId
-            scope.launch {
-                diskCache.evictOlderThan(MAX_TTS_SESSIONS)
-                val manifest = TtsSessionManifest(
+            if (adopted != null) {
+                // 复用已有 manifest；不要覆盖写，否则丢失原始 createdAt
+                lastSessionManifest = adopted
+            } else {
+                scope.launch {
+                    diskCache.evictOlderThan(MAX_TTS_SESSIONS)
+                    val manifest = TtsSessionManifest(
+                        sessionId = newSessionId.toString(),
+                        createdAt = System.currentTimeMillis(),
+                        providerFingerprint = fingerprint,
+                        originalText = text,
+                        chunkCount = newChunks.size,
+                        chunkTexts = newChunks.map { it.text },
+                    )
+                    diskCache.writeManifest(manifest)
+                }
+                lastSessionManifest = TtsSessionManifest(
                     sessionId = newSessionId.toString(),
                     createdAt = System.currentTimeMillis(),
-                    providerFingerprint = diskCache.fingerprint(provider),
+                    providerFingerprint = fingerprint,
                     originalText = text,
                     chunkCount = newChunks.size,
                     chunkTexts = newChunks.map { it.text },
                 )
-                diskCache.writeManifest(manifest)
             }
             allChunks.addAll(newChunks)
             queue.addAll(newChunks)
@@ -168,16 +188,6 @@ class TtsController(
             allChunks.addAll(remapped)
             queue.addAll(remapped)
         }
-        // 记录最近一次会话，供 replayLast 使用
-        lastSessionManifest = TtsSessionManifest(
-            sessionId = (currentSessionId ?: UUID.randomUUID()).toString(),
-            createdAt = System.currentTimeMillis(),
-            providerFingerprint = diskCache.fingerprint(provider),
-            originalText = text,
-            chunkCount = if (flush) newChunks.size else (lastSessionManifest?.chunkCount ?: 0) + newChunks.size,
-            chunkTexts = if (flush) newChunks.map { it.text }
-                else (lastSessionManifest?.chunkTexts ?: emptyList()) + newChunks.map { it.text },
-        )
         _totalChunks.update { queue.size }
         _error.update { null }
 

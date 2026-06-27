@@ -101,6 +101,52 @@ class TtsDiskCache(context: Context) {
         }
     }
 
+    /**
+     * Find the most recently modified on-disk session whose manifest matches [text]
+     * and [fingerprint]. Used by speak() to adopt an existing sessionId when the user
+     * starts a fresh speak on the same message that was previously cached, so that
+     * replay works after an app restart.
+     */
+    suspend fun findSessionByText(
+        text: String,
+        fingerprint: String,
+    ): TtsSessionManifest? = withContext(Dispatchers.IO) {
+        findSessionByTextBlocking(text, fingerprint)
+    }
+
+    /**
+     * Synchronous variant used inside speak() on the calling thread. Cheap enough to
+     * call inline: a single directory scan + at most one small JSON read per session,
+     * capped at MAX_TTS_SESSIONS directories.
+     */
+    fun findSessionByTextBlocking(
+        text: String,
+        fingerprint: String,
+    ): TtsSessionManifest? = runCatching {
+        val dirs = rootDir.listFiles { f -> f.isDirectory } ?: return@runCatching null
+        dirs
+            .filter { File(it, MANIFEST_FILENAME).exists() }
+            .sortedByDescending { it.lastModified() }
+            .firstNotNullOfOrNull { dir ->
+                val sessionId = runCatching { UUID.fromString(dir.name) }.getOrNull()
+                    ?: return@firstNotNullOfOrNull null
+                val manifest = readManifestBlocking(sessionId) ?: return@firstNotNullOfOrNull null
+                if (manifest.chunkCount != manifest.chunkTexts.size) return@firstNotNullOfOrNull null
+                if (manifest.providerFingerprint != fingerprint) return@firstNotNullOfOrNull null
+                if (manifest.originalText != text) return@firstNotNullOfOrNull null
+                manifest
+            }
+    }.getOrElse {
+        Log.w(TAG, "findSessionByTextBlocking failed", it)
+        null
+    }
+
+    private fun readManifestBlocking(sessionId: UUID): TtsSessionManifest? = runCatching {
+        val file = File(sessionDir(sessionId), MANIFEST_FILENAME)
+        if (!file.exists()) return@runCatching null
+        json.decodeFromString(TtsSessionManifest.serializer(), file.readText())
+    }.getOrNull()
+
     suspend fun evictOlderThan(maxSessions: Int) = withContext(Dispatchers.IO) {
         runCatching {
             val dirs = rootDir.listFiles { f -> f.isDirectory } ?: return@runCatching
