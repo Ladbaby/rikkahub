@@ -10,7 +10,11 @@ val buildWebUi = tasks.register<Exec>("buildWebUi") {
     description = "Build web-ui and copy its static output into the web module resources."
 
     workingDir = webUiDir.asFile
-    commandLine("zsh", "-ic", "pnpm run build")
+    commandLine(if (org.gradle.internal.os.OperatingSystem.current().isWindows) {
+        listOf("cmd", "/c", "pnpm run build")
+    } else {
+        listOf("bash", "-lc", "pnpm run build")
+    })
 
     inputs.files(
         webUiDir.file("package.json"),
