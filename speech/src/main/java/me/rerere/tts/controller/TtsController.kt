@@ -271,6 +271,8 @@ class TtsController(
      * 重放最近一次朗读。空操作情形：
      * - 未配置 provider
      * - 没有可用的上一次会话（首次启动 / 缓存被清空 / provider 切换后旧缓存已失效）
+     *
+     * 必须复用 manifest 的 sessionId，否则所有磁盘上的 chunk 都将失效、播放时全量重新合成。
      */
     fun replayLast() {
         val manifest = lastSessionManifest ?: return
@@ -284,8 +286,35 @@ class TtsController(
             lastSessionManifest = null
             return
         }
-        // 复用 speak 入口：写入新的会话 ID，确保后续缓存落到正确的目录
-        speak(manifest.originalText, flush = true)
+
+        // 复位运行时状态，但保留磁盘上的会话目录与原始 sessionId
+        internalReset()
+        val replaySessionId = UUID.fromString(manifest.sessionId)
+        currentSessionId = replaySessionId
+
+        val replayChunks = chunker.split(manifest.originalText)
+        if (replayChunks.isEmpty()) return
+        // 复用 manifest 里的 index，让磁盘上的 chunk 索引对得上
+        val indexed = replayChunks.mapIndexed { i, c -> c.copy(index = i) }
+        allChunks.addAll(indexed)
+        queue.addAll(indexed)
+        lastSessionManifest = manifest.copy(
+            createdAt = System.currentTimeMillis(),
+        )
+        _currentChunk.update { 0 }
+        _totalChunks.update { queue.size }
+        _error.update { null }
+        _playbackState.update {
+            it.copy(
+                currentChunkIndex = _currentChunk.value,
+                totalChunks = _totalChunks.value,
+                status = PlaybackStatus.Buffering,
+            )
+        }
+
+        if (workerJob?.isActive != true) startWorker()
+        // 从 0 开始预取，让预取也走磁盘优先的路径
+        prefetchFrom(0)
     }
 
     fun clearLastHttpError() {
@@ -370,7 +399,7 @@ class TtsController(
         for (i in begin until endExclusive) {
             val chunk = allChunks.getOrNull(i) ?: continue
             cache.computeIfAbsent(chunk.id) {
-                scope.async(Dispatchers.IO) { synthesizeOrLoad(provider, chunk, sessionId) }
+                scope.async(Dispatchers.IO) { loadOrSynthesize(provider, chunk, sessionId) }
             }
         }
         lastPrefetchedIndex = endExclusive - 1
@@ -379,18 +408,7 @@ class TtsController(
     private suspend fun awaitOrCreate(chunk: TtsChunk, provider: TTSProviderSetting): TTSResponse {
         val sessionId = currentSessionId
         val deferred = cache.computeIfAbsent(chunk.id) {
-            scope.async(Dispatchers.IO) {
-                if (sessionId != null) {
-                    diskCache.readChunk(sessionId, chunk.index)?.let { bytes ->
-                        return@async TTSResponse(
-                            audioData = bytes,
-                            format = AudioFormat.MP3,
-                            metadata = mapOf("source" to "disk"),
-                        )
-                    }
-                }
-                synthesizeOrLoad(provider, chunk, sessionId)
-            }
+            scope.async(Dispatchers.IO) { loadOrSynthesize(provider, chunk, sessionId) }
         }
         return try {
             deferred.await()
@@ -400,13 +418,23 @@ class TtsController(
     }
 
     /**
-     * 合成音频并落盘。磁盘写入失败不会阻塞播放。
+     * 磁盘优先读取；命中失败时走网络合成并落盘，供 prefetch 与播放两个路径共用，
+     * 确保重放时所有 chunk（无论是否被预取）都走相同的"先看磁盘"逻辑。
      */
-    private suspend fun synthesizeOrLoad(
+    private suspend fun loadOrSynthesize(
         provider: TTSProviderSetting,
         chunk: TtsChunk,
         sessionId: UUID?,
     ): TTSResponse {
+        if (sessionId != null) {
+            diskCache.readChunk(sessionId, chunk.index)?.let { bytes ->
+                return TTSResponse(
+                    audioData = bytes,
+                    format = AudioFormat.MP3,
+                    metadata = mapOf("source" to "disk"),
+                )
+            }
+        }
         val response = synthesizer.synthesize(provider, chunk)
         if (sessionId != null) {
             diskCache.writeChunk(sessionId, chunk.index, response.audioData)
